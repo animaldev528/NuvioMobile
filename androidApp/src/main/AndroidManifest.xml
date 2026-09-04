@@ -165,6 +165,12 @@
             android:foregroundServiceType="mediaPlayback"
             android:stopWithTask="false" />
 
+        <service
+            android:name="com.nuvio.app.features.boomio.PrivateListeningService"
+            android:exported="false"
+            android:foregroundServiceType="mediaPlayback"
+            android:stopWithTask="false" />
+
         <receiver
             android:name="com.nuvio.app.features.player.PlayerNowPlayingActionReceiver"
             android:exported="false" />

@@ -13,6 +13,7 @@ import com.nuvio.app.core.auth.AuthStorage
 import com.nuvio.app.core.network.ServerConfigurationStorage
 import com.nuvio.app.features.boomio.BoomioSessionRepository
 import com.nuvio.app.features.boomio.BoomioSessionStorage
+import com.nuvio.app.features.boomio.PrivateListeningSession
 import com.nuvio.app.core.diagnostics.SentryInitializer
 import com.nuvio.app.core.deeplink.handleAppUrl
 import com.nuvio.app.core.storage.PlatformLocalAccountDataCleaner
@@ -93,6 +94,7 @@ open class MainActivity : AppCompatActivity() {
         AuthStorage.initialize(applicationContext)
         BoomioSessionStorage.initialize(applicationContext)
         BoomioSessionRepository.initialize()
+        PrivateListeningSession.initialize(applicationContext)
         ServerConfigurationStorage.initialize(applicationContext)
         LibraryStorage.initialize(applicationContext)
         WatchedStorage.initialize(applicationContext)

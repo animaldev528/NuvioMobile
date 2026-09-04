@@ -20,6 +20,7 @@ import io.ktor.websocket.Frame
 import io.ktor.websocket.close
 import io.ktor.websocket.readText
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -67,8 +68,16 @@ sealed interface CompanionEvent {
     /** The paired TV (re)connected and restored its state. */
     data class StateRestored(val tvDeviceId: String, val name: String) : CompanionEvent
 
-    /** A live playback / media / audio-fork push from the paired TV. */
+    /** A live playback / media push from the paired TV. */
     data class TvPush(val tvDeviceId: String?, val type: String) : CompanionEvent
+
+    /**
+     * The TV's reply to an `audio_fork_start` / `audio_fork_stop` request.
+     * [status] is `started`, `stopped`, or `error`; on `error`, [reason] is the
+     * failure code the TV sent (`no_active_player`, `bad_phone_address`,
+     * `different_network`, `fork_unavailable`).
+     */
+    data class AudioFork(val status: String, val reason: String?) : CompanionEvent
 
     /** bsc tore down the phone→TV handoff because the heartbeat expired. */
     data object Timeout : CompanionEvent
@@ -179,6 +188,11 @@ object CompanionBridge {
     @Volatile private var lastScrubUpdate: TimeSource.Monotonic.ValueTimeMark? = null
     @Volatile private var lastSearchTextSendAt: TimeSource.Monotonic.ValueTimeMark? = null
     @Volatile private var pendingSearchText: String? = null
+
+    /** Guards [pendingAudioForkAck]. */
+    private val audioForkAckLock = Any()
+    /** Non-null only while an `audio_fork_start` arm is awaiting its ack. */
+    private var pendingAudioForkAck: CompletableDeferred<CompanionEvent.AudioFork>? = null
 
     /**
      * Binds the bridge to [BoomioSessionRepository.session]. Idempotent — call
@@ -338,6 +352,35 @@ object CompanionBridge {
         sendFrame { put("type", "keyboard_submit") }
     }
 
+    /**
+     * Ask the paired TV to start Roku-style private listening: tee the audio it
+     * is already decoding for its own speakers to a UDP socket this phone bound
+     * at [ip]:[port]. [ip] must be the phone's actual LAN IPv4 (the TV rejects
+     * anything off its own subnet with `different_network`) and [port] the
+     * already-bound receiver's local port — the hub relays both as supplied.
+     */
+    fun startAudioFork(ip: String, port: Int) =
+        sendFrame { put("type", "audio_fork_start"); put("phoneIp", ip); put("port", port) }
+
+    /** Ask the paired TV to stop forking its audio to this phone. */
+    fun stopAudioFork() =
+        sendFrame { put("type", "audio_fork_stop") }
+
+    /**
+     * Register a completer for the next `started`/`error` `audio_fork` ack.
+     *
+     * Called synchronously *before* the `audio_fork_start` frame is sent, so no
+     * ack can slip through between the send and the registration (a hot SharedFlow
+     * with no subscriber would drop it). Any stale waiter from a previous arm is
+     * cancelled and replaced. The arm coroutine awaits [CompletableDeferred.await]
+     * on the returned deferred with its own timeout.
+     */
+    fun registerAudioForkAckWaiter(): CompletableDeferred<CompanionEvent.AudioFork> =
+        synchronized(audioForkAckLock) {
+            pendingAudioForkAck?.cancel()
+            CompletableDeferred<CompanionEvent.AudioFork>().also { pendingAudioForkAck = it }
+        }
+
     private inline fun sendFrame(build: kotlinx.serialization.json.JsonObjectBuilder.() -> Unit) {
         val session = wsSession ?: return
         val payload = buildJsonObject(build)
@@ -444,7 +487,7 @@ object CompanionBridge {
                     )
                 }
             }
-            "companion:now_playing_changed", "media_changed", "audio_fork" -> {
+            "companion:now_playing_changed", "media_changed" -> {
                 _events.tryEmit(
                     CompanionEvent.TvPush(
                         tvDeviceId = msg["tvDeviceId"]?.jsonPrimitive?.contentOrNull,
@@ -453,6 +496,22 @@ object CompanionBridge {
                 )
                 // Best-effort: keep the now-playing line current.
                 refreshDevices()
+            }
+            "audio_fork" -> {
+                // TV's ack to our audio_fork_start/stop — carry the status and
+                // reason so the private-listening controller can act on them.
+                val ack = CompanionEvent.AudioFork(
+                    status = msg["status"]?.jsonPrimitive?.contentOrNull ?: "",
+                    reason = msg["reason"]?.jsonPrimitive?.contentOrNull,
+                )
+                _events.tryEmit(ack)
+                // Complete the ack waiter installed before the arm request was
+                // sent. The deferred is set only while an arm is in flight, so a
+                // stray ack (e.g. a late "stopped") never completes a fresh one.
+                if (ack.status == "started" || ack.status == "error") {
+                    val pending = synchronized(audioForkAckLock) { pendingAudioForkAck }
+                    pending?.complete(ack)
+                }
             }
             "companion:timeout" -> _events.tryEmit(CompanionEvent.Timeout)
             "error" -> {
