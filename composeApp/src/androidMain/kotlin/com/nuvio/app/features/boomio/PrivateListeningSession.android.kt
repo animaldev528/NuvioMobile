@@ -2,7 +2,8 @@ package com.nuvio.app.features.boomio
 
 import co.touchlab.kermit.Logger
 import java.net.DatagramSocket
-import java.net.InetAddress
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -76,6 +77,7 @@ actual object PrivateListeningSession {
         val port = socket?.localPort ?: 0
         if (ip == null || socket == null || port <= 0) {
             socket?.close()
+            log.w { "resolveLanIpv4=$ip bind=${socket != null} port=$port — no LAN address to advertise" }
             _state.value = PrivateListeningUiState(failure = PrivateListeningFailure.NoNetwork)
             return
         }
@@ -144,19 +146,57 @@ actual object PrivateListeningSession {
     }
 
     /**
-     * Best-effort LAN IPv4, resolved with the same default-route trick the TV's
-     * `bestEffortLanIp()` uses, so both ends agree on which interface/subnet to
-     * compare. `connect` performs no network I/O — it just pins the route so the
-     * kernel reports the local address that would carry that traffic.
+     * Best-effort LAN IPv4 to advertise to the TV, resolved from the up network
+     * interfaces — NOT the connect-to-8.8.8.8 default-route trick. The trick did
+     * real socket I/O, which (a) threw on the UI thread (arm() runs from the
+     * toggle on the main thread → NetworkOnMainThreadException was swallowed into
+     * "no network to stream over") and (b) broke on phones with no internet
+     * route even though the fork is direct LAN unicast and needs only an address
+     * on the same subnet as the TV. Prefers Wi-Fi/Ethernet site-local IPv4;
+     * skips loopback, virtual, tun/ppp/rmnet. Pure local lookup — safe on any
+     * thread, no route/DNS dependency.
      */
-    private fun resolveLanIpv4(): String? = try {
-        DatagramSocket().use { probe ->
-            probe.connect(InetAddress.getByName("8.8.8.8"), 10_002)
-            probe.localAddress?.hostAddress?.takeIf { ip ->
-                ip != "0.0.0.0" && ip != "127.0.0.1" && ip.count { it == '.' } == 3
+    private fun resolveLanIpv4(): String? {
+        var best: String? = null
+        var bestScore = Int.MAX_VALUE
+        try {
+            val interfaces = NetworkInterface.getNetworkInterfaces() ?: return null
+            for (net in interfaces) {
+                if (!net.isUp || net.isLoopback || net.isVirtual) continue
+                val lower = net.name.lowercase()
+                if ("tun" in lower || "ppp" in lower || "rmnet" in lower) continue
+                val score = when {
+                    lower.startsWith("wlan") -> 0
+                    lower.startsWith("eth") || lower.startsWith("en") -> 1
+                    else -> 2
+                }
+                for (addr in net.inetAddresses) {
+                    if (addr !is Inet4Address) continue
+                    val ip = addr.hostAddress ?: continue
+                    if (ip.startsWith("127.") || !isPrivateLan(ip)) continue
+                    if (score < bestScore || (score == bestScore && best == null)) {
+                        bestScore = score
+                        best = ip
+                    }
+                }
             }
+        } catch (_: Throwable) {
+            return null
         }
-    } catch (_: Throwable) {
-        null
+        return best
+    }
+
+    /** True for the RFC1918 site-local ranges the companion LAN lives on. */
+    private fun isPrivateLan(ip: String): Boolean {
+        val parts = ip.split(".")
+        if (parts.size != 4) return false
+        val first = parts[0].toIntOrNull() ?: return false
+        if (first == 10) return true
+        if (first == 192 && parts[1] == "168") return true
+        if (first == 172) {
+            val second = parts[1].toIntOrNull() ?: return false
+            return second in 16..31
+        }
+        return false
     }
 }
