@@ -40,7 +40,6 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -64,6 +63,7 @@ import com.nuvio.app.core.ui.NuvioScreenHeader
 import com.nuvio.app.core.ui.NuvioSurfaceCard
 import com.nuvio.app.core.ui.NuvioToastController
 import kotlinx.coroutines.delay
+import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.TimeSource
 import nuvio.composeapp.generated.resources.Res
@@ -111,6 +111,9 @@ import nuvio.composeapp.generated.resources.companion_pl_error_fork
 import nuvio.composeapp.generated.resources.companion_pl_error_no_network
 import nuvio.composeapp.generated.resources.companion_pl_error_no_player
 import nuvio.composeapp.generated.resources.companion_pl_error_timeout
+import nuvio.composeapp.generated.resources.companion_pl_sync
+import nuvio.composeapp.generated.resources.companion_pl_sync_hint
+import nuvio.composeapp.generated.resources.companion_pl_sync_ms
 import nuvio.composeapp.generated.resources.companion_private_listening
 import nuvio.composeapp.generated.resources.companion_private_listening_hint
 import nuvio.composeapp.generated.resources.companion_private_listening_on
@@ -324,6 +327,13 @@ private fun DevicePicker(
     }
 }
 
+// Audio-sync slider domain in ms, relative to the receiver's 100 ms baseline
+// prefill. Kept inside ForkUdpReceiver's clamp window (20..500 ms prefill) so the
+// shown value is always the applied value. 10 ms per discrete step.
+private const val SYNC_MIN_MS = -80
+private const val SYNC_MAX_MS = 200
+private const val SYNC_STEP_MS = 10
+
 @Composable
 private fun RemoteControls(
     pairedDeviceId: String,
@@ -350,13 +360,11 @@ private fun RemoteControls(
 
     val device = devices.firstOrNull { it.deviceId == pairedDeviceId }
 
-    // Leaving the remote must end any active private-listening fork (the hub's
-    // heartbeat timeout would stop it on the TV anyway, but stopping here is
-    // immediate and keeps the phone's socket/track from lingering).
-    DisposableEffect(Unit) {
-        onDispose { PrivateListeningSession.stop() }
-    }
-
+    // Leaving the remote does NOT end an active fork: a foreground service
+    // ([PrivateListeningForeground]) holds the process while the fork plays, so
+    // audio keeps coming when the user does something else on the phone or the
+    // screen goes dark. Only the toggle, the notification's Stop, or swiping the
+    // app away ends it.
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         ConnectionStatusLine(connected = connected, connectedHub = connectedHub, connectingHub = connectingHub)
         Text(
@@ -771,49 +779,110 @@ private fun PrivateListeningToggle() {
     val showError = state.status == PrivateListeningStatus.Idle && state.failure != null
 
     NuvioSurfaceCard {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            Icon(
-                imageVector = Icons.Rounded.Headphones,
-                contentDescription = null,
-                tint = if (active) {
-                    MaterialTheme.colorScheme.primary
-                } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                },
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            Column(
-                modifier = Modifier.weight(1f),
-                verticalArrangement = Arrangement.spacedBy(2.dp),
+        Column {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text(title, style = MaterialTheme.typography.titleSmall)
-                Text(
-                    subtitle,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = if (showError) {
-                        MaterialTheme.colorScheme.error
+                Icon(
+                    imageVector = Icons.Rounded.Headphones,
+                    contentDescription = null,
+                    tint = if (active) {
+                        MaterialTheme.colorScheme.primary
                     } else {
                         MaterialTheme.colorScheme.onSurfaceVariant
                     },
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
                 )
-                if (active && endpoint != null) {
+                Spacer(modifier = Modifier.width(12.dp))
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.spacedBy(2.dp),
+                ) {
+                    Text(title, style = MaterialTheme.typography.titleSmall)
                     Text(
-                        endpoint,
+                        subtitle,
                         style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        color = if (showError) {
+                            MaterialTheme.colorScheme.error
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
                     )
+                    if (active && endpoint != null) {
+                        Text(
+                            endpoint,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
                 }
+                Switch(
+                    checked = active,
+                    enabled = !busy,
+                    onCheckedChange = { PrivateListeningSession.toggle() },
+                )
             }
-            Switch(
-                checked = active,
-                enabled = !busy,
-                onCheckedChange = { PrivateListeningSession.toggle() },
+            // Only reachable while audio is actually forking — tune against the
+            // live TV picture; releasing the thumb re-cushions at the new delay
+            // (a brief gap, then audio at the new latency).
+            if (active) {
+                AudioSyncSlider()
+            }
+        }
+    }
+}
+
+/**
+ * Phone-vs-TV audio-sync slider, shown while a fork is active. Shifts the playout
+ * prefill around the receiver's 100 ms baseline: negative = phone audio sooner
+ * (it currently trails the TV picture), positive = later. The slider domain
+ * (−80..+200 ms) sits inside the receiver's clamp window (20..500 ms prefill ⇒
+ * offset −80..+400) so the shown value is always the applied value. Committed on
+ * thumb release — the receiver re-cushions live; the session persists the value.
+ */
+@Composable
+private fun AudioSyncSlider() {
+    val syncLabel = stringResource(Res.string.companion_pl_sync)
+    val syncHint = stringResource(Res.string.companion_pl_sync_hint)
+    val msFormat = stringResource(Res.string.companion_pl_sync_ms)
+    val committed by PrivateListeningSession.syncOffsetMs.collectAsStateWithLifecycle()
+    var draft by remember { mutableStateOf(committed) }
+    val steps = (SYNC_MAX_MS - SYNC_MIN_MS) / SYNC_STEP_MS - 1
+    Column(
+        modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                syncLabel,
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+                msFormat.format(draft),
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary,
             )
         }
+        Slider(
+            value = draft.toFloat(),
+            onValueChange = { draft = it.roundToInt() },
+            onValueChangeFinished = { PrivateListeningSession.setSyncOffsetMs(draft) },
+            valueRange = SYNC_MIN_MS.toFloat()..SYNC_MAX_MS.toFloat(),
+            steps = steps,
+        )
+        Text(
+            syncHint,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
     }
 }

@@ -78,6 +78,17 @@ expect object PrivateListeningSession {
     /** Arm when idle/failed; disarm when arming/active/stopping. */
     fun toggle()
 
-    /** Force-stop anything forked (screen leave / disconnect). No-op when idle. */
+    /** Force-stop anything forked (user toggle / notification Stop / link drop). No-op when idle. */
     fun stop()
+
+    /**
+     * Persisted phone-vs-TV audio-sync offset in ms (positive = phone audio plays
+     * later, relative to the ~100 ms baseline the receiver pre-fills). Setup-
+     * dependent — tune on the Companion remote until the phone audio matches the
+     * TV picture; the value survives restarts.
+     */
+    val syncOffsetMs: StateFlow<Int>
+
+    /** Adjust [syncOffsetMs] (persisted, live-applied to an active fork). */
+    fun setSyncOffsetMs(offsetMs: Int)
 }

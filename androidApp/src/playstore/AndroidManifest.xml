@@ -13,6 +13,9 @@
         <service
             android:name="com.nuvio.app.features.player.PlayerNowPlayingService"
             tools:node="remove" />
+        <service
+            android:name="com.nuvio.app.features.boomio.PrivateListeningService"
+            tools:node="remove" />
     </application>
 
 </manifest>

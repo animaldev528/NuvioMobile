@@ -12,8 +12,15 @@ actual object PrivateListeningSession {
     private val _state = MutableStateFlow(
         PrivateListeningUiState(status = PrivateListeningStatus.Unsupported),
     )
+    private val _syncOffsetMs = MutableStateFlow(0)
 
     actual val state: StateFlow<PrivateListeningUiState> = _state.asStateFlow()
+
+    actual val syncOffsetMs: StateFlow<Int> = _syncOffsetMs.asStateFlow()
+
+    actual fun setSyncOffsetMs(offsetMs: Int) {
+        _syncOffsetMs.value = offsetMs
+    }
 
     actual fun toggle() = Unit
     actual fun stop() = Unit

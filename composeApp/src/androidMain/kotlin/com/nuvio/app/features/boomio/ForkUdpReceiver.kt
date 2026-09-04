@@ -15,8 +15,10 @@ private const val MAX_DATAGRAM_BYTES = 2048 // TV sender caps datagrams at 1200 
 private const val MIN_SAMPLE_RATE = 8_000
 private const val MAX_SAMPLE_RATE = 192_000
 private const val BYTES_PER_FRAME = 4       // stereo * 16-bit PCM
-private const val BUFFER_MS = 200           // AudioTrack jitter cushion (realtime buffer)
-private const val PREFILL_MS = 100          // play only after ~100 ms has accumulated
+private const val BASE_PREFILL_MS = 100     // baseline playout prefill (play only after ~100 ms)
+private const val MIN_PREFILL_MS = 20       // sync slider floor — below this the phone underruns
+private const val MAX_PREFILL_MS = 500      // sync slider ceiling — beyond this it's unusable lag
+private const val JITTER_CUSHION_MS = 120   // extra AudioTrack buffer above prefill for network jitter
 
 /**
  * Receives the TV's private-listening PCM stream on a bound [DatagramSocket]
@@ -31,12 +33,20 @@ private const val PREFILL_MS = 100          // play only after ~100 ms has accum
  *   bytes 6..   PCM16 signed little-endian stereo interleaved
  * ```
  *
- * The AudioTrack's own buffer IS the jitter buffer: it is sized to ~200 ms and
- * ~100 ms is prefilled (written while the track is still stopped) before
- * [AudioTrack.play] is called, so network jitter lands inside the cushion
- * instead of popping the speaker. After play, streaming `write()` blocks when
- * the buffer is full, so the phone is paced by the TV's decode clock and cannot
- * drift (R4 in the spec — ~100 ms fixed startup offset, accepted for v1).
+ * The AudioTrack's own buffer IS the jitter buffer: it is sized to the playout
+ * prefill plus a [JITTER_CUSHION_MS] cushion, and ~[BASE_PREFILL_MS] (+ the
+ * user's audio-sync offset, see [setSyncOffsetMs]) is prefilled (written while
+ * the track is still stopped) before [AudioTrack.play] is called, so network
+ * jitter lands inside the cushion instead of popping the speaker. After play,
+ * streaming `write()` blocks when the buffer is full, so the phone is paced by
+ * the TV's decode clock and cannot drift (R4 in the spec).
+ *
+ * Audio sync: the phone is structurally a fixed offset behind the TV's decoded
+ * moment, dominated by the prefill + OS output latency. The companion remote's
+ * Audio sync slider shifts that offset in ~± steps around the baseline by
+ * changing the prefill target; [setSyncOffsetMs] while playing tears the track
+ * down and re-cushions to the new target (a brief gap, then audio at the new
+ * delay). This corrects the setup-dependent TV-vs-phone lip-sync offset.
  *
  * All socket + AudioTrack work happens on a single daemon thread; [close]
  * unblocks the blocking receive by closing the socket, joins the thread, and
@@ -47,17 +57,25 @@ internal class ForkUdpReceiver(private val socket: DatagramSocket) {
     private val closed = AtomicBoolean(false)
     @Volatile private var running = true
 
+    @Volatile private var syncOffsetMs = 0
+
     private val buffer = ByteArray(MAX_DATAGRAM_BYTES)
 
     // AudioTrack state — touched only from the receiver thread (post-join in close()).
     private var track: AudioTrack? = null
     private var trackSampleRate = 0
     private var trackPlaying = false
+    private var appliedPrefillMs = 0
     private var prefilledBytes = 0
 
     private val thread = Thread({ runLoop() }, "nuvio-pl-udp-receiver").apply { isDaemon = true }
 
     fun start() = thread.start()
+
+    /** User audio-sync offset in ms (+ = later). Applied live; persists in the session. */
+    fun setSyncOffsetMs(offsetMs: Int) {
+        syncOffsetMs = offsetMs
+    }
 
     fun close() {
         if (!closed.compareAndSet(false, true)) return
@@ -94,23 +112,31 @@ internal class ForkUdpReceiver(private val socket: DatagramSocket) {
     private fun writePcm(sampleRate: Int, payloadLen: Int) {
         ensureTrack(sampleRate)
         val current = track ?: return
+        val wantPrefill = targetPrefillMs()
         val written = runCatching { current.write(buffer, PREAMBLE_BYTES, payloadLen) }.getOrDefault(0)
         if (written <= 0) return
         if (!trackPlaying) {
             prefilledBytes += written
-            if (prefilledBytes >= msBytes(sampleRate, PREFILL_MS)) {
+            if (prefilledBytes >= msBytes(sampleRate, wantPrefill)) {
                 runCatching { current.play() }
                 trackPlaying = true
             }
         }
     }
 
+    /** The current prefill target: the 100 ms baseline plus the user's sync offset. */
+    private fun targetPrefillMs(): Int =
+        (BASE_PREFILL_MS + syncOffsetMs).coerceIn(MIN_PREFILL_MS, MAX_PREFILL_MS)
+
     /**
-     * Create (or rebuild, on a sample-rate change) the [AudioTrack] for [sampleRate].
-     * Rebuilding resets the prefill cushion so a mid-stream track change re-cushions.
+     * Create (or rebuild) the [AudioTrack] for [sampleRate]. Rebuilds when the
+     * sample rate changes (mid-stream track change) OR the playout prefill
+     * target moves (audio-sync slider) — both reset the cushion so playback
+     * re-syncs at the new latency.
      */
     private fun ensureTrack(sampleRate: Int) {
-        if (track != null && trackSampleRate == sampleRate) return
+        val wantPrefill = targetPrefillMs()
+        if (track != null && trackSampleRate == sampleRate && appliedPrefillMs == wantPrefill) return
         val previous = track
         if (previous != null) {
             runCatching { previous.stop() }
@@ -119,6 +145,7 @@ internal class ForkUdpReceiver(private val socket: DatagramSocket) {
         track = null
         trackSampleRate = 0
         trackPlaying = false
+        appliedPrefillMs = wantPrefill
         prefilledBytes = 0
 
         val minBuffer = AudioTrack.getMinBufferSize(
@@ -127,7 +154,10 @@ internal class ForkUdpReceiver(private val socket: DatagramSocket) {
             AudioFormat.ENCODING_PCM_16BIT,
         )
         val minBufferSafe = if (minBuffer > 0) minBuffer else 4_000
-        val bufferBytes = maxOf(minBufferSafe * 2, msBytes(sampleRate, BUFFER_MS))
+        val bufferBytes = maxOf(
+            minBufferSafe * 2,
+            msBytes(sampleRate, wantPrefill + JITTER_CUSHION_MS),
+        )
         val attributes = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)

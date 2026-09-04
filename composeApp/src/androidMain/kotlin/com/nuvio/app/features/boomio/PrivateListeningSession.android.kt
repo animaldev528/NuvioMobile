@@ -1,5 +1,6 @@
 package com.nuvio.app.features.boomio
 
+import android.content.Context
 import co.touchlab.kermit.Logger
 import java.net.DatagramSocket
 import java.net.Inet4Address
@@ -16,6 +17,9 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeout
 
+private const val PREFS_NAME = "nuvio_private_listening"
+private const val SYNC_OFFSET_KEY = "sync_offset_ms"
+
 /**
  * Android actual of [PrivateListeningSession].
  *
@@ -26,7 +30,11 @@ import kotlinx.coroutines.withTimeout
  *  - The TV's `started`/`error` ack is awaited through a waiter registered
  *    synchronously before the send (see [CompanionBridge.registerAudioForkAckWaiter]),
  *    so the ack can never be dropped.
- *  - If the companion link drops mid-arm or mid-stream, the hub's heartbeat
+ *  - While the fork is [PrivateListeningStatus.Active] the session promotes a
+ *    foreground service ([PrivateListeningForeground]) so the audio keeps playing
+ *    when the user leaves the Companion screen or the OS trims background apps —
+ *    a media-player hold, not a screen-bound feature.
+ *  - If the companion link drops mid-arm / mid-stream, the hub's heartbeat
  *    expiry has already stopped the fork on the TV; we tear the receiver down
  *    and report [PrivateListeningFailure.ConnectionLost].
  */
@@ -40,9 +48,32 @@ actual object PrivateListeningSession {
     private val _state = MutableStateFlow(PrivateListeningUiState())
     actual val state: StateFlow<PrivateListeningUiState> = _state.asStateFlow()
 
+    private val _syncOffsetMs = MutableStateFlow(0)
+    actual val syncOffsetMs: StateFlow<Int> = _syncOffsetMs.asStateFlow()
+
+    @Volatile private var appContext: Context? = null
+
     private var ackJob: Job? = null
     private var linkWatchJob: Job? = null
     @Volatile private var receiver: ForkUdpReceiver? = null
+
+    /** App-lifetime Context for the foreground service + persisted sync offset. */
+    actual fun initialize(context: Context) {
+        appContext = context.applicationContext
+        _syncOffsetMs.value = appContext
+            ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ?.getInt(SYNC_OFFSET_KEY, 0)
+            ?: 0
+    }
+
+    actual fun setSyncOffsetMs(offsetMs: Int) {
+        _syncOffsetMs.value = offsetMs
+        appContext?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            ?.edit()
+            ?.putInt(SYNC_OFFSET_KEY, offsetMs)
+            ?.apply()
+        receiver?.setSyncOffsetMs(offsetMs)
+    }
 
     actual fun toggle() {
         if (_state.value.status == PrivateListeningStatus.Active ||
@@ -64,6 +95,7 @@ actual object PrivateListeningSession {
         // Harmless when nothing armed; clears a partial arm / unwinds a live fork.
         CompanionBridge.stopAudioFork()
         _state.value = PrivateListeningUiState()
+        refreshForegroundHost()
     }
 
     private fun arm() {
@@ -79,10 +111,12 @@ actual object PrivateListeningSession {
             socket?.close()
             log.w { "resolveLanIpv4=$ip bind=${socket != null} port=$port — no LAN address to advertise" }
             _state.value = PrivateListeningUiState(failure = PrivateListeningFailure.NoNetwork)
+            refreshForegroundHost()
             return
         }
 
         val recv = ForkUdpReceiver(socket)
+        recv.setSyncOffsetMs(_syncOffsetMs.value)
         receiver = recv
         recv.start()
 
@@ -100,6 +134,7 @@ actual object PrivateListeningSession {
             ackJob?.cancel()
             teardown()
             _state.value = PrivateListeningUiState(failure = PrivateListeningFailure.ConnectionLost)
+            refreshForegroundHost()
         }
 
         ackJob = scope.launch {
@@ -114,6 +149,7 @@ actual object PrivateListeningSession {
                     teardown()
                     CompanionBridge.stopAudioFork() // the TV may have armed regardless
                     _state.value = PrivateListeningUiState(failure = PrivateListeningFailure.Timeout)
+                    refreshForegroundHost()
                 }
                 ack.status == "started" -> {
                     log.i { "Private listening active ($ip:$port)" }
@@ -121,12 +157,16 @@ actual object PrivateListeningSession {
                         status = PrivateListeningStatus.Active,
                         endpoint = "$ip:$port",
                     )
+                    // Hold the process at foreground while the fork plays so
+                    // backgrounding / memory pressure doesn't stop the audio.
+                    refreshForegroundHost()
                 }
                 else -> {
                     val failure = mapFailure(ack.reason)
                     log.w { "audio_fork_start rejected: ${ack.reason}" }
                     teardown()
                     _state.value = PrivateListeningUiState(failure = failure)
+                    refreshForegroundHost()
                 }
             }
         }
@@ -136,6 +176,16 @@ actual object PrivateListeningSession {
         ackJob?.cancel(); ackJob = null
         linkWatchJob?.cancel(); linkWatchJob = null
         receiver?.close(); receiver = null
+    }
+
+    /** Promote the foreground service while Active; drop it otherwise. */
+    private fun refreshForegroundHost() {
+        val context = appContext ?: return
+        if (_state.value.status == PrivateListeningStatus.Active) {
+            PrivateListeningForeground.start(context)
+        } else {
+            PrivateListeningForeground.stop(context)
+        }
     }
 
     private fun mapFailure(reason: String?): PrivateListeningFailure = when (reason) {

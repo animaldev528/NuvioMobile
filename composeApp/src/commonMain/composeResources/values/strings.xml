@@ -575,6 +575,9 @@
     <string name="companion_pl_error_no_network">This phone has no network to stream over.</string>
     <string name="companion_pl_error_timeout">The TV didn’t answer — try again.</string>
     <string name="companion_pl_error_connection">The connection to the TV was lost.</string>
+    <string name="companion_pl_sync">Audio sync</string>
+    <string name="companion_pl_sync_hint">Align the phone’s audio with the TV picture. Positive delays it — tune until lips match.</string>
+    <string name="companion_pl_sync_ms">%1$d ms</string>
     <string name="companion_toast_timeout">Your TV went quiet. Check it’s still on.</string>
     <string name="companion_toast_not_paired">Choose a TV first.</string>
     <string name="companion_toast_rate_limited">Too many commands — slow down.</string>
