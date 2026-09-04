@@ -748,6 +748,9 @@ private fun PrivateListeningToggle() {
     val active = state.status == PrivateListeningStatus.Active
     val busy = state.status == PrivateListeningStatus.Arming ||
         state.status == PrivateListeningStatus.Stopping
+    // Hoist before the null check: `state` is a delegated property, so Kotlin
+    // won't smart-cast past a null check on `state.endpoint`.
+    val endpoint = state.endpoint
 
     val subtitle = when (state.status) {
         PrivateListeningStatus.Active -> onLabel
@@ -798,9 +801,9 @@ private fun PrivateListeningToggle() {
                     maxLines = 2,
                     overflow = TextOverflow.Ellipsis,
                 )
-                if (active && state.endpoint != null) {
+                if (active && endpoint != null) {
                     Text(
-                        state.endpoint,
+                        endpoint,
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
