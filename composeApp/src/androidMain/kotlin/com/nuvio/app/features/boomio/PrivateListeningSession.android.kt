@@ -58,7 +58,7 @@ actual object PrivateListeningSession {
     @Volatile private var receiver: ForkUdpReceiver? = null
 
     /** App-lifetime Context for the foreground service + persisted sync offset. */
-    actual fun initialize(context: Context) {
+    fun initialize(context: Context) {
         appContext = context.applicationContext
         _syncOffsetMs.value = appContext
             ?.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
