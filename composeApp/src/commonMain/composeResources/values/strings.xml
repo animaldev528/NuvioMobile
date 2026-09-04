@@ -564,6 +564,17 @@
     <string name="companion_nothing_playing">Nothing playing</string>
     <string name="companion_playing">Playing</string>
     <string name="companion_paused">Paused</string>
+    <string name="companion_private_listening">Private listening</string>
+    <string name="companion_private_listening_hint">Stream this TV’s audio to the phone — plug in headphones for private listening.</string>
+    <string name="companion_private_listening_on">On — audio is streaming to this phone.</string>
+    <string name="companion_private_listening_starting">Starting…</string>
+    <string name="companion_private_listening_stopping">Stopping…</string>
+    <string name="companion_pl_error_no_player">Nothing is playing on the TV.</string>
+    <string name="companion_pl_error_different_network">Phone and TV are on different networks.</string>
+    <string name="companion_pl_error_fork">The TV couldn’t start private listening.</string>
+    <string name="companion_pl_error_no_network">This phone has no network to stream over.</string>
+    <string name="companion_pl_error_timeout">The TV didn’t answer — try again.</string>
+    <string name="companion_pl_error_connection">The connection to the TV was lost.</string>
     <string name="companion_toast_timeout">Your TV went quiet. Check it’s still on.</string>
     <string name="companion_toast_not_paired">Choose a TV first.</string>
     <string name="companion_toast_rate_limited">Too many commands — slow down.</string>

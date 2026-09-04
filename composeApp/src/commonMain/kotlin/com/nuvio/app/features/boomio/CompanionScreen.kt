@@ -17,6 +17,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Headphones
 import androidx.compose.material.icons.rounded.KeyboardArrowDown
 import androidx.compose.material.icons.rounded.KeyboardArrowLeft
 import androidx.compose.material.icons.rounded.KeyboardArrowRight
@@ -35,9 +36,11 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -102,6 +105,17 @@ import nuvio.composeapp.generated.resources.companion_unlink
 import nuvio.composeapp.generated.resources.companion_unlink_confirm
 import nuvio.composeapp.generated.resources.companion_unlinked_description
 import nuvio.composeapp.generated.resources.companion_unlinked_title
+import nuvio.composeapp.generated.resources.companion_pl_error_connection
+import nuvio.composeapp.generated.resources.companion_pl_error_different_network
+import nuvio.composeapp.generated.resources.companion_pl_error_fork
+import nuvio.composeapp.generated.resources.companion_pl_error_no_network
+import nuvio.composeapp.generated.resources.companion_pl_error_no_player
+import nuvio.composeapp.generated.resources.companion_pl_error_timeout
+import nuvio.composeapp.generated.resources.companion_private_listening
+import nuvio.composeapp.generated.resources.companion_private_listening_hint
+import nuvio.composeapp.generated.resources.companion_private_listening_on
+import nuvio.composeapp.generated.resources.companion_private_listening_starting
+import nuvio.composeapp.generated.resources.companion_private_listening_stopping
 import nuvio.composeapp.generated.resources.companion_volume
 import nuvio.composeapp.generated.resources.compose_settings_page_companion
 import org.jetbrains.compose.resources.stringResource
@@ -152,6 +166,7 @@ fun CompanionScreen(
                 is CompanionEvent.NotPaired -> NuvioToastController.show(notPairedToast)
                 is CompanionEvent.RateLimited -> NuvioToastController.show(rateLimitedToast)
                 is CompanionEvent.StateRestored -> NuvioToastController.show(stateRestoredToast)
+                is CompanionEvent.AudioFork -> Unit // consumed by PrivateListeningSession's ack waiter
                 is CompanionEvent.TvPush -> Unit
                 is CompanionEvent.Error -> event.message?.let { NuvioToastController.show(it) }
             }
@@ -335,6 +350,13 @@ private fun RemoteControls(
 
     val device = devices.firstOrNull { it.deviceId == pairedDeviceId }
 
+    // Leaving the remote must end any active private-listening fork (the hub's
+    // heartbeat timeout would stop it on the TV anyway, but stopping here is
+    // immediate and keeps the phone's socket/track from lingering).
+    DisposableEffect(Unit) {
+        onDispose { PrivateListeningSession.stop() }
+    }
+
     Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
         ConnectionStatusLine(connected = connected, connectedHub = connectedHub, connectingHub = connectingHub)
         Text(
@@ -394,6 +416,8 @@ private fun RemoteControls(
         }
 
         VolumeSlider(volumeLabel = volumeLabel)
+
+        PrivateListeningToggle()
 
         OutlinedButton(
             onClick = { CompanionBridge.unpair() },
@@ -696,5 +720,97 @@ private fun UnlinkRow() {
                 }
             },
         )
+    }
+}
+
+/**
+ * Roku-style private listening toggle: arm/stop the TV's audio fork from the
+ * remote. Rendered only when the platform supports it ([PrivateListeningStatus.Unsupported]
+ * hides it entirely — e.g. iOS).
+ */
+@Composable
+private fun PrivateListeningToggle() {
+    val state by PrivateListeningSession.state.collectAsStateWithLifecycle()
+    if (state.status == PrivateListeningStatus.Unsupported) return
+
+    val title = stringResource(Res.string.companion_private_listening)
+    val hint = stringResource(Res.string.companion_private_listening_hint)
+    val onLabel = stringResource(Res.string.companion_private_listening_on)
+    val startingLabel = stringResource(Res.string.companion_private_listening_starting)
+    val stoppingLabel = stringResource(Res.string.companion_private_listening_stopping)
+    val errorNoPlayer = stringResource(Res.string.companion_pl_error_no_player)
+    val errorDifferentNetwork = stringResource(Res.string.companion_pl_error_different_network)
+    val errorFork = stringResource(Res.string.companion_pl_error_fork)
+    val errorNoNetwork = stringResource(Res.string.companion_pl_error_no_network)
+    val errorTimeout = stringResource(Res.string.companion_pl_error_timeout)
+    val errorConnection = stringResource(Res.string.companion_pl_error_connection)
+
+    val active = state.status == PrivateListeningStatus.Active
+    val busy = state.status == PrivateListeningStatus.Arming ||
+        state.status == PrivateListeningStatus.Stopping
+
+    val subtitle = when (state.status) {
+        PrivateListeningStatus.Active -> onLabel
+        PrivateListeningStatus.Arming -> startingLabel
+        PrivateListeningStatus.Stopping -> stoppingLabel
+        PrivateListeningStatus.Idle -> when (state.failure) {
+            PrivateListeningFailure.NoActivePlayer -> errorNoPlayer
+            PrivateListeningFailure.DifferentNetwork -> errorDifferentNetwork
+            PrivateListeningFailure.BadAddress,
+            PrivateListeningFailure.ForkUnavailable -> errorFork
+            PrivateListeningFailure.NoNetwork -> errorNoNetwork
+            PrivateListeningFailure.Timeout -> errorTimeout
+            PrivateListeningFailure.ConnectionLost -> errorConnection
+            null -> hint
+        }
+        PrivateListeningStatus.Unsupported -> hint
+    }
+    val showError = state.status == PrivateListeningStatus.Idle && state.failure != null
+
+    NuvioSurfaceCard {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Headphones,
+                contentDescription = null,
+                tint = if (active) {
+                    MaterialTheme.colorScheme.primary
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(2.dp),
+            ) {
+                Text(title, style = MaterialTheme.typography.titleSmall)
+                Text(
+                    subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (showError) {
+                        MaterialTheme.colorScheme.error
+                    } else {
+                        MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (active && state.endpoint != null) {
+                    Text(
+                        state.endpoint,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            Switch(
+                checked = active,
+                enabled = !busy,
+                onCheckedChange = { PrivateListeningSession.toggle() },
+            )
+        }
     }
 }
