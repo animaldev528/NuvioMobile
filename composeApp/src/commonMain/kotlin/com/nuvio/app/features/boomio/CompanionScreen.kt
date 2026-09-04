@@ -846,7 +846,6 @@ private fun PrivateListeningToggle() {
 private fun AudioSyncSlider() {
     val syncLabel = stringResource(Res.string.companion_pl_sync)
     val syncHint = stringResource(Res.string.companion_pl_sync_hint)
-    val msFormat = stringResource(Res.string.companion_pl_sync_ms)
     val committed by PrivateListeningSession.syncOffsetMs.collectAsStateWithLifecycle()
     var draft by remember { mutableStateOf(committed) }
     val steps = (SYNC_MAX_MS - SYNC_MIN_MS) / SYNC_STEP_MS - 1
@@ -865,7 +864,7 @@ private fun AudioSyncSlider() {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             Text(
-                msFormat.format(draft),
+                stringResource(Res.string.companion_pl_sync_ms, draft),
                 style = MaterialTheme.typography.labelMedium,
                 color = MaterialTheme.colorScheme.primary,
             )
